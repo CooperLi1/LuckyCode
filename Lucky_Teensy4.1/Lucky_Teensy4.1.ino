@@ -9,6 +9,7 @@
 const float L1 = 61.0; 
 const float L2 = 59.0; 
 
+const float START_X = -8;   
 const float START_Y = 88.0; 
 
 const float HIP_CPD  = 11.644; 
