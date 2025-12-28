@@ -30,8 +30,8 @@ float pitchDeadband = 10.0;
 // LEG GAINS (Roll)
 float kpRoll  = 0.3; 
 float smoothing = 0.2;        
-float rollDeadband = 3.0;     // No movement within +- 2 degrees
-float rollLimit = 6.0;        // Max 6mm leg height change
+float rollDeadband = 3.0;     
+float rollLimit = 6.0;        
 
 float filteredPitch = 0.0;
 float filteredRoll  = 90.0;
@@ -40,7 +40,12 @@ float lastPitch = 0.0;
 const float PITCH_OFFSET = 0;  
 const float ROLL_OFFSET  = 90; 
 
-// --- 3. PIN DEFINITIONS ---
+// --- 3. LUCKY ACTION STATE ---
+enum LuckyState { IDLE, THINKING, DANCING };
+LuckyState currentState = IDLE;
+unsigned long actionTimer = 0;
+
+// --- 4. PIN DEFINITIONS ---
 const int H1_DIR = 28; const int H1_PWM = 29;
 const int H2_DIR = 24; const int H2_PWM = 25;
 const int K1_DIR = 10; const int K1_PWM = 12;
@@ -49,13 +54,13 @@ const int W1_DIR = 2;  const int W1_PWM = 3;
 const int W2_DIR = 4;  const int W2_PWM = 6;
 const int PIN_MIC = 22;
 
-// --- 4. AUDIO ---
+// --- 5. AUDIO ---
 AudioSynthWaveformSine sine1;          
 AudioOutputI2S         i2s1;           
 AudioConnection        p1(sine1, 0, i2s1, 0);
 AudioConnection        p2(sine1, 0, i2s1, 1);
 
-// --- 5. PID STRUCTURE (Joints) ---
+// --- 6. PID STRUCTURE ---
 struct PIDController {
   float Kp = 5.0, Ki = 0.0, Kd = 3.0; 
   long target = 0;             
@@ -71,7 +76,7 @@ struct PIDController {
       if (currentSetpoint > target) currentSetpoint = target;
     } else if (currentSetpoint > target) {
       currentSetpoint -= maxVel;
-      if (currentSetpoint < target) currentSetpoint = target;
+      if (currentSetpoint > target) currentSetpoint = target;
     }
     long error = (long)currentSetpoint - current;
     integral = constrain(integral + error, -100, 100);
@@ -103,7 +108,7 @@ void setup() {
   AudioMemory(12); sine1.amplitude(0);
   int pins[] = {H1_DIR, H1_PWM, H2_DIR, H2_PWM, K1_DIR, K1_PWM, K2_DIR, K2_PWM, W1_DIR, W1_PWM, W2_DIR, W2_PWM};
   for(int p : pins) pinMode(p, OUTPUT);
-  if(!bno.begin()) Serial.println("IMU OFFLINE");
+  bno.begin();
   analogWriteFrequency(H1_PWM, 20000); 
 
   solveIK(START_X, START_Y, hipStartAngle, kneeStartAngle);
@@ -123,62 +128,77 @@ void loop() {
   if (millis() - lastPIDTime >= 10) {
     lastPIDTime = millis();
 
+    sensors_event_t event;
+    bno.getEvent(&event);
+    filteredPitch = (smoothing * event.orientation.y) + ((1.0 - smoothing) * filteredPitch);
+    filteredRoll  = (smoothing * event.orientation.z) + ((1.0 - smoothing) * filteredRoll);
+
+    float pErr = filteredPitch - PITCH_OFFSET;
+    float rErr = filteredRoll - ROLL_OFFSET;
+    float pitchRate = filteredPitch - lastPitch;
+    lastPitch = filteredPitch;
+
+    // Default modifiers for Actions
+    float autoW1 = 0; 
+    float autoW2 = 0;
+
+    // --- 1. ACTION TIMEOUT CHECK ---
+    if (currentState != IDLE && millis() > actionTimer) {
+        currentState = IDLE;
+        sine1.amplitude(0);
+        w1_speed = 0;  // Explicitly turn off wheel power
+        w2_speed = 0;
+    }
+
+    // --- 2. LUCKY ACTIONS CALCULATION ---
+    if (currentState == THINKING) {
+      autoW1 = 80; // Circular spin (one wheel only)
+      if (millis() % 60 < 10) sine1.frequency(random(300, 1200));
+      sine1.amplitude(0.2);
+    } 
+    else if (currentState == DANCING) {
+      // Differential oscillation (Back and forth)
+      float danceTurn = sin(millis() * 0.008) * 100.0; 
+      autoW1 = danceTurn;
+      autoW2 = -danceTurn;
+    }
+
+    // --- 3. POWER MERGING & EXECUTION ---
     if (balanceEnabled) {
-      sensors_event_t event;
-      bno.getEvent(&event);
-      
-      // 1. FILTERING
-      filteredPitch = (smoothing * event.orientation.y) + ((1.0 - smoothing) * filteredPitch);
-      filteredRoll  = (smoothing * event.orientation.z) + ((1.0 - smoothing) * filteredRoll);
-      
-      float pErr = filteredPitch - PITCH_OFFSET;
-      float rErr = filteredRoll - ROLL_OFFSET;
-      
-      // 2. WHEEL PITCH CONTROL (With Pitch Deadband)
-      float pitchRate = filteredPitch - lastPitch;
-      lastPitch = filteredPitch;
-
-      float wheelPower = 0;
+      // Calculate Balancing Base
+      float balancePower = 0;
       if (abs(pErr) > pitchDeadband) {
-          wheelPower = (pErr * kpWheel) + (pitchRate * kdWheel);
+          balancePower = (pErr * kpWheel) + (pitchRate * kdWheel);
       }
-      
-      wheelPower = constrain(wheelPower, -wheelMax, wheelMax);
-      w1_speed = w2_speed = (int)wheelPower;
+      // Add balance to action movement
+      w1_speed = constrain((int)(balancePower + autoW1), -wheelMax, wheelMax);
+      w2_speed = constrain((int)(balancePower + autoW2), -wheelMax, wheelMax);
 
-      // 3. LEG ROLL CONTROL (With Roll Deadband and 6mm Limit)
+      // Kinematic Roll Logic
       float rollEffect = 0;
       if (abs(rErr) > rollDeadband) {
-          rollEffect = rErr * kpRoll;
-          rollEffect = constrain(rollEffect, -rollLimit, rollLimit); // Max 6mm
+          rollEffect = constrain(rErr * kpRoll, -rollLimit, rollLimit);
       }
-
-      float leftY  = targetY + rollEffect;
-      float rightY = targetY - rollEffect;
-      
-      // Safety constraints for physical leg limits
-      leftY = constrain(leftY, 80, 130);
-      rightY = constrain(rightY, 80, 130);
-
       float hL, kL, hR, kR;
-      solveIK(targetX, leftY, hL, kL);  
-      solveIK(targetX, rightY, hR, kR); 
-
+      solveIK(targetX, targetY + rollEffect, hL, kL);  
+      solveIK(targetX, targetY - rollEffect, hR, kR); 
       pidH1.target = (long)((hL - hipStartAngle) * HIP_CPD);
       pidK1.target = (long)((kL - kneeStartAngle) * KNEE_CPD);
       pidH2.target = (long)((hR - hipStartAngle) * HIP_CPD);
       pidK2.target = (long)((kR - kneeStartAngle) * KNEE_CPD);
-
-      if (debugLevel && (millis() % 500 < 10)) {
-        Serial1.printf("P_ERR:%.1f W_PWR:%d | R_EFF:%.1f LY:%.1f\n", pErr, w1_speed, rollEffect, leftY);
-      }
+    } 
+    else if (currentState != IDLE) {
+      // Balancing is off, but an action is running: apply auto values directly
+      w1_speed = (int)autoW1;
+      w2_speed = (int)autoW2;
     }
 
-    // Apply Motor Power
+    // Apply Calculated Power to All Motors
     applyMotorPower(H1_DIR, H1_PWM, -pidH1.calculate(encH1.read())); 
     applyMotorPower(H2_DIR, H2_PWM, pidH2.calculate(encH2.read()));
     applyMotorPower(K1_DIR, K1_PWM, pidK1.calculate(encK1.read()));
     applyMotorPower(K2_DIR, K2_PWM, -pidK2.calculate(encK2.read())); 
+    
     applyMotorPower(W1_DIR, W1_PWM, -w1_speed);                     
     applyMotorPower(W2_DIR, W2_PWM, w2_speed);
   }
@@ -190,50 +210,37 @@ void applyMotorPower(int dPin, int pPin, float val) {
 }
 
 void processCommand(String cmd) {
-  // A. BALANCING & DEBUG
-  if (cmd == "BAL:ON") balanceEnabled = true;
-  else if (cmd == "BAL:OFF") { balanceEnabled = false; w1_speed = 0; w2_speed = 0; }
+  cmd.toUpperCase();
+  
+  // A. MANUAL WHEEL CONTROL (Parser fix)
+  if (cmd.startsWith("W ") || cmd.startsWith("WHEEL:")) {
+    int val = 0;
+    // Extract the numeric value from the end of the string
+    int lastSpace = cmd.lastIndexOf(" ");
+    int lastColon = cmd.lastIndexOf(":");
+    int index = max(lastSpace, lastColon);
+    val = cmd.substring(index + 1).toInt();
+
+    if (cmd.indexOf("W1") != -1) w1_speed = val;
+    else if (cmd.indexOf("W2") != -1) w2_speed = val;
+  }
+  // B. ACTION COMMANDS
+  else if (cmd == "LUCKY:THINK") { currentState = THINKING; actionTimer = millis() + 5000; }
+  else if (cmd == "LUCKY:DANCE") { currentState = DANCING; actionTimer = millis() + 5000; }
+  
+  // C. CORE CONTROLS
+  else if (cmd == "BAL:ON") balanceEnabled = true;
+  else if (cmd == "BAL:OFF") { balanceEnabled = false; w1_speed = 0; w2_speed = 0; currentState = IDLE; }
   else if (cmd == "DEBUG:ON") debugLevel = true;
   else if (cmd == "DEBUG:OFF") debugLevel = false;
-
-  // B. GAIN TUNING
-  else if (cmd.startsWith("GAIN:WHEEL:P:")) kpWheel = cmd.substring(13).toFloat();
-  else if (cmd.startsWith("GAIN:WHEEL:D:")) kdWheel = cmd.substring(13).toFloat();
-  else if (cmd.startsWith("GAIN:ROLL:P:"))  kpRoll  = cmd.substring(12).toFloat();
-  else if (cmd.startsWith("GAIN:")) {
-    int f = cmd.indexOf(':', 5); int s = cmd.indexOf(':', f + 1);
-    String joint = cmd.substring(5, f); char type = cmd.charAt(s - 1); float val = cmd.substring(s + 1).toFloat();
-    PIDController* t;
-    if (joint == "H1") t = &pidH1; else if (joint == "H2") t = &pidH2; else if (joint == "K1") t = &pidK1; else t = &pidK2;
-    if (type == 'P') t->Kp = val; else if (type == 'I') t->Ki = val; else t->Kd = val;
-  }
-
-  // C. POSITION & VELOCITY
-  else if (cmd.startsWith("POS:")) {
-    int f = cmd.indexOf(':', 4); targetX = cmd.substring(4, f).toFloat(); targetY = cmd.substring(f + 1).toFloat();
-  }
-  else if (cmd.startsWith("VEL:")) {
-    int f = cmd.indexOf(':', 4); float v = cmd.substring(f + 1).toFloat();
-    pidH1.maxVel = pidH2.maxVel = pidK1.maxVel = pidK2.maxVel = v;
-  }
-
-  // D. HARDWARE TESTS
+  
+  // D. DIAGNOSTICS & HARDWARE
+  else if (cmd == "GET_IMU") { sensors_event_t e; bno.getEvent(&e); Serial1.printf("IMU: P:%.2f R:%.2f\n", e.orientation.y, e.orientation.z); }
+  else if (cmd == "GET_ENC") { Serial1.printf("ENC: %ld %ld %ld %ld\n", encH1.read(), encH2.read(), encK1.read(), encK2.read()); }
   else if (cmd == "ZERO:ALL") {
     encH1.write(0); encH2.write(0); encK1.write(0); encK2.write(0);
     pidH1.target = pidH2.target = pidK1.target = pidK2.target = 0;
     pidH1.currentSetpoint = pidH2.currentSetpoint = pidK1.currentSetpoint = pidK2.currentSetpoint = 0;
   }
-  else if (cmd == "GET_IMU") { sensors_event_t e; bno.getEvent(&e); Serial1.printf("IMU: P:%.2f R:%.2f\n", e.orientation.y, e.orientation.z); }
-  else if (cmd == "GET_ENC") { Serial1.printf("ENC: %ld %ld %ld %ld\n", encH1.read(), encH2.read(), encK1.read(), encK2.read()); }
-  else if (cmd == "GET_MIC") { Serial1.printf("MIC: %d\n", analogRead(PIN_MIC)); }
   else if (cmd == "TEST_SPK") { sine1.frequency(440); sine1.amplitude(0.5); delay(200); sine1.amplitude(0); }
-  else if (cmd == "TEST_H1") pulseMotor(H1_DIR, H1_PWM, true);
-  else if (cmd == "TEST_H2") pulseMotor(H2_DIR, H2_PWM, false);
-  else if (cmd.startsWith("WHEEL:")) {
-    int s = cmd.substring(9).toInt(); if (cmd.substring(6,8) == "W1") w1_speed = s; else w2_speed = s;
-  }
-}
-
-void pulseMotor(int d, int p, bool inv) {
-  digitalWrite(d, inv ? LOW : HIGH); analogWrite(p, 120); delay(150); analogWrite(p, 0);
 }
